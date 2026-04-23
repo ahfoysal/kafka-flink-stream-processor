@@ -1,5 +1,6 @@
 data/
 data_m2/
+data_m3/
 bin/
 *.log
 .DS_Store
