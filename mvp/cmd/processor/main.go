@@ -1,7 +1,6 @@
-// processor: minimal "stream processor" DAG.
-// Reads integers from --in topic as group --group, doubles them, writes
-// to --out topic. Demonstrates the (source -> map -> sink) pattern that a
-// real Flink-style engine generalizes.
+// processor: minimal "stream processor" DAG. M2-aware.
+// Reads integers from --in topic as group --group across ALL partitions,
+// doubles them, writes to --out topic (producer-side hash partitioning).
 package main
 
 import (
@@ -10,6 +9,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
@@ -18,13 +18,56 @@ import (
 	"time"
 )
 
+type partitionMeta struct {
+	Partition int   `json:"partition"`
+	Leader    int   `json:"leader"`
+	Followers []int `json:"followers"`
+}
+type topicMeta struct {
+	Topic      string          `json:"topic"`
+	Partitions []partitionMeta `json:"partitions"`
+}
+type metadataResp struct {
+	Topics  []topicMeta    `json:"topics"`
+	Brokers map[string]any `json:"brokers"`
+}
+
 type consumeRecord struct {
-	Offset  uint64 `json:"offset"`
-	Payload string `json:"payload"`
+	Offset    uint64 `json:"offset"`
+	Partition int    `json:"partition"`
+	Payload   string `json:"payload"`
 }
 type consumeResp struct {
 	Records []consumeRecord `json:"records"`
 	Next    uint64          `json:"next"`
+}
+
+func fetchMeta(broker, topic string) (topicMeta, map[int]string) {
+	u := broker + "/metadata?topic=" + url.QueryEscape(topic)
+	resp, err := http.Get(u)
+	if err != nil {
+		log.Fatalf("metadata %s: %v", topic, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		log.Fatalf("metadata %s status=%d body=%s", topic, resp.StatusCode, body)
+	}
+	var m metadataResp
+	if err := json.Unmarshal(body, &m); err != nil {
+		log.Fatalf("metadata decode: %v", err)
+	}
+	brokers := make(map[int]string)
+	for k, v := range m.Brokers {
+		id, err := strconv.Atoi(k)
+		if err != nil {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			brokers[id] = s
+		}
+	}
+	return m.Topics[0], brokers
 }
 
 func main() {
@@ -35,38 +78,51 @@ func main() {
 	idleMs := flag.Int("idle-ms", 1500, "stop after this many ms with no new input")
 	flag.Parse()
 
-	base, err := url.Parse(*addr)
-	if err != nil {
-		log.Fatalf("bad broker url: %v", err)
-	}
+	inMeta, brokers := fetchMeta(*addr, *inTopic)
+	outMeta, outBrokers := fetchMeta(*addr, *outTopic)
 
-	var (
-		processed int
-		idleSince time.Time
-	)
+	var processed int
+	var idleSince time.Time
 	for {
-		u := *base
-		u.Path = "/consume"
-		q := u.Query()
-		q.Set("topic", *inTopic)
-		q.Set("group", *group)
-		q.Set("max", "100")
-		u.RawQuery = q.Encode()
-
-		resp, err := http.Get(u.String())
-		if err != nil {
-			log.Fatalf("consume: %v", err)
+		got := 0
+		for _, p := range inMeta.Partitions {
+			leaderURL := brokers[p.Leader]
+			u := fmt.Sprintf("%s/consume?topic=%s&group=%s&partition=%d&max=100",
+				leaderURL, url.QueryEscape(*inTopic), url.QueryEscape(*group), p.Partition)
+			resp, err := http.Get(u)
+			if err != nil {
+				log.Fatalf("consume: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				log.Fatalf("consume status=%d body=%s", resp.StatusCode, string(body))
+			}
+			var cr consumeResp
+			if err := json.Unmarshal(body, &cr); err != nil {
+				log.Fatalf("decode: %v", err)
+			}
+			for _, r := range cr.Records {
+				pl, err := base64.StdEncoding.DecodeString(r.Payload)
+				if err != nil {
+					log.Fatalf("payload decode: %v", err)
+				}
+				n, err := strconv.ParseInt(string(pl), 10, 64)
+				if err != nil {
+					log.Printf("skip non-integer off=%d: %q", r.Offset, string(pl))
+					continue
+				}
+				doubled := []byte(strconv.FormatInt(n*2, 10))
+				// hash-partition on the original value so outputs fan out
+				key := []byte(strconv.FormatInt(n, 10))
+				if err := produceOut(outMeta, outBrokers, *outTopic, key, doubled); err != nil {
+					log.Fatalf("produce: %v", err)
+				}
+				processed++
+				got++
+			}
 		}
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != 200 {
-			log.Fatalf("consume status=%d body=%s", resp.StatusCode, string(body))
-		}
-		var cr consumeResp
-		if err := json.Unmarshal(body, &cr); err != nil {
-			log.Fatalf("decode: %v", err)
-		}
-		if len(cr.Records) == 0 {
+		if got == 0 {
 			if idleSince.IsZero() {
 				idleSince = time.Now()
 			}
@@ -77,33 +133,19 @@ func main() {
 			continue
 		}
 		idleSince = time.Time{}
-		for _, r := range cr.Records {
-			p, err := base64.StdEncoding.DecodeString(r.Payload)
-			if err != nil {
-				log.Fatalf("payload decode: %v", err)
-			}
-			n, err := strconv.ParseInt(string(p), 10, 64)
-			if err != nil {
-				log.Printf("skip non-integer payload off=%d: %q", r.Offset, string(p))
-				continue
-			}
-			doubled := []byte(strconv.FormatInt(n*2, 10))
-			if err := produce(base, *outTopic, doubled); err != nil {
-				log.Fatalf("produce: %v", err)
-			}
-			processed++
-		}
 	}
 	fmt.Printf("processor done: processed=%d in=%q -> out=%q\n", processed, *inTopic, *outTopic)
 }
 
-func produce(base *url.URL, topic string, payload []byte) error {
-	u := *base
-	u.Path = "/produce"
-	q := u.Query()
-	q.Set("topic", topic)
-	u.RawQuery = q.Encode()
-	resp, err := http.Post(u.String(), "application/octet-stream", bytes.NewReader(payload))
+func produceOut(meta topicMeta, brokers map[int]string, topic string, key, payload []byte) error {
+	n := len(meta.Partitions)
+	h := fnv.New32a()
+	h.Write(key)
+	part := int(h.Sum32() % uint32(n))
+	leader := meta.Partitions[part].Leader
+	u := fmt.Sprintf("%s/produce?topic=%s&partition=%d&key=%s",
+		brokers[leader], url.QueryEscape(topic), part, url.QueryEscape(string(key)))
+	resp, err := http.Post(u, "application/octet-stream", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}

@@ -221,6 +221,52 @@ func (t *Topic) NextOffset() uint64 {
 	return t.nextOff
 }
 
+// AppendAt writes a record with an explicit, caller-chosen offset. It is used
+// by followers during replication: the leader picks the offset, followers
+// must store the record at that exact offset so every replica stays
+// byte-identical.
+//
+// The offset must equal the topic's current NextOffset (no gaps, no rewrites).
+// On success, nextOffset advances by one.
+func (t *Topic) AppendAt(offset uint64, payload []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if offset != t.nextOff {
+		// Idempotency: silently accept a re-send of an offset already stored.
+		if offset < t.nextOff {
+			return nil
+		}
+		return fmt.Errorf("replication gap: got offset %d, want %d", offset, t.nextOff)
+	}
+
+	active := t.segments[len(t.segments)-1]
+	if active.size >= t.maxSegmentSize {
+		seg, err := createSegment(t.dir, t.nextOff)
+		if err != nil {
+			return err
+		}
+		t.segments = append(t.segments, seg)
+		active = seg
+	}
+
+	var hdr [recordHeaderSize]byte
+	binary.BigEndian.PutUint64(hdr[0:8], offset)
+	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(payload)))
+	if _, err := active.file.Write(hdr[:]); err != nil {
+		return err
+	}
+	if _, err := active.file.Write(payload); err != nil {
+		return err
+	}
+	if err := active.file.Sync(); err != nil {
+		return err
+	}
+	active.size += int64(recordHeaderSize + len(payload))
+	t.nextOff++
+	return nil
+}
+
 // Read reads up to maxRecords records starting at fromOffset (inclusive).
 // Returns the records and the next offset to read from.
 func (t *Topic) Read(fromOffset uint64, maxRecords int) ([]Record, uint64, error) {
