@@ -217,6 +217,33 @@ func (s *Store) loadOffsets() error {
 // Keyed state writes are already durable because each Put is its own tx.
 // ----------------------------------------------------------------------------
 
+// DB returns the underlying bbolt handle. The checkpoint subsystem needs
+// direct access to compose multi-bucket transactions. Callers should only
+// use this for Update/View; never close the returned DB.
+func (s *Store) DB() *bolt.DB { return s.db }
+
+// Offsets returns a snapshot of the in-memory offset cursor. The
+// checkpoint subsystem writes this into __offsets as part of its 2PC.
+func (s *Store) Offsets() map[string]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]uint64, len(s.offsets))
+	for k, v := range s.offsets {
+		out[k] = v
+	}
+	return out
+}
+
+// ReloadOffsets re-reads __offsets from disk into the in-memory cursor.
+// Used on recovery: after a crash the task must resume from what was
+// durably committed, not from whatever the dying process had staged.
+func (s *Store) ReloadOffsets() error {
+	s.mu.Lock()
+	s.offsets = map[string]uint64{}
+	s.mu.Unlock()
+	return s.loadOffsets()
+}
+
 // Checkpoint writes current source offsets into the __offsets bucket.
 func (s *Store) Checkpoint() error {
 	s.mu.Lock()
