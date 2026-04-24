@@ -7,6 +7,89 @@
 ## Full Vision
 Kafka-compatible log + Flink-style processor, exactly-once, event-time windows + watermarks, stateful operators with RocksDB, checkpoint/restore, SQL API, connectors.
 
+## MVP Status — M6 done
+
+Stream-stream interval joins, KTable-style materialized views with an
+interactive query HTTP API, and a Debezium-style SQLite CDC source
+connector.
+
+**What's new in M6:**
+
+- **Interval joins** (`mvp/internal/dataflow/join.go`): Flink-style
+  `IntervalJoinOp` with asymmetric bounds. For every pair `(a ∈ A, b ∈ B)`
+  with matching keys where `LowerBound <= a.ts - b.ts <= UpperBound`, emit
+  `Fn(a, b)`. Both sides buffer into bbolt (keyed by
+  `<ts_nanos><seq><user_key>`, so iteration is already in time order), and
+  each incoming record probes the opposite side's buffer and GC's entries
+  older than the widest bound. Sits alongside the M3 `JoinOp` (symmetric
+  ±Bound) rather than replacing it.
+
+- **Materialized views** (`mvp/internal/view/`): KStream → KTable
+  semantics. `view.Open` creates a bbolt file; `Register(name)` returns a
+  handle with `Upsert(k, v)` (nil = tombstone / delete), `IncrCount(k)`,
+  `AddSum(k, delta)`, and `Lookup*` readers. Every view is a bucket
+  `view__<name>` in the shared file. The registry exposes an HTTP handler:
+
+  ```
+  GET /view/<name>?key=K   → 200 {"key":"K","value":"...","uint64":"N"}
+                           → 404 if unknown
+  GET /view/<name>         → 200 {"name":"<name>","size":N}
+  GET /view/                → 200 {"views":[...]}
+  ```
+
+  This is Kafka Streams' "interactive queries" in miniature — point a
+  consumer at the HTTP API and read the latest aggregate for a key without
+  replaying the changelog topic.
+
+- **CDC source (SQLite)** (`mvp/internal/connectors/cdc_sqlite.go`):
+  Debezium-style change-data-capture. SQLite's WAL isn't usable as a
+  logical feed without extensions, so for M6 we snapshot-and-diff on a
+  poll interval and emit a Debezium-shaped envelope per change:
+
+  ```json
+  {
+    "op": "c" | "u" | "d",
+    "before": { ... } | null,
+    "after":  { ... } | null,
+    "source": {"db":"...", "table":"...", "ts_ms": ...}
+  }
+  ```
+
+  Each event is produced to the configured topic keyed by the primary
+  key, so hash-partitioning keeps updates for a single row on one
+  partition (required for correct view-state ordering downstream).
+  Pure-Go SQLite driver (`modernc.org/sqlite`) — no CGo, matching the
+  rest of the stack.
+
+**Demo pipeline** (design, not wired into `scripts/demo_m6.sh` yet):
+
+```
+cdc_sqlite(users table) ─► topic:"users.cdc"  ─┐
+                                               ├─► IntervalJoinOp ─► MaterializedView
+reference_stream       ─► topic:"ref"          ─┘                       │
+                                                                        ▼
+                                                          GET /view/enriched_users?key=42
+```
+
+**Test coverage:** `internal/view/view_test.go` exercises upsert /
+tombstone / IncrCount / HTTP API (200, 404, summary). 
+`internal/connectors/cdc_sqlite_test.go` drives the full c / u / d
+lifecycle against a tempfile SQLite, asserting every event is keyed by
+the PK. `internal/dataflow/interval_join_test.go` covers asymmetric
+bounds, stale-B non-matches, cross-key non-matches, and B-arrives-first
+probing. All pass.
+
+**M6 non-goals (deferred):**
+- Real WAL / logical-replication tailing. Poll-and-diff is fine at demo
+  scale but doesn't scale to multi-GB tables.
+- Wiring `IntervalJoinOp` into the builder API and the runtime's
+  two-channel merge shim — for now the operator is usable directly
+  (driven by tests). Builder integration lands with M7 multi-input DAGs.
+- Schema evolution in the CDC envelope. `before` / `after` columns are
+  whatever the current table shape is; there is no schema registry.
+
+---
+
 ## MVP Status — M3 done
 
 Flink-style stream processor on top of the M2 log: a builder API
@@ -211,7 +294,8 @@ scripts/demo_m3.sh  M3 end-to-end demo: word-count DAG + bbolt state
 - **M2 (Week 3):** Partitioning + replication (ISR model) — DONE
 - **M3 (Week 6):** Stream DAG + stateful ops (count, join) with bbolt — DONE
 - **M4 (Week 9):** Event-time + watermarks + tumbling/sliding/session windows
-- **M5 (Week 12):** Exactly-once (2PC) + checkpoints + SQL frontend
+- **M5 (Week 12):** Exactly-once (2PC) + checkpoints + SQL frontend — DONE
+- **M6 (Week 15):** Stream-stream interval joins + materialized views + CDC source — DONE
 
 ## Key References
 - Kafka design doc
