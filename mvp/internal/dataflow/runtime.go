@@ -119,6 +119,21 @@ func runTask(ctx context.Context, g *StreamGraph, bv *BrokerView,
 				OpName: s.name, Store: store, Partition: partition,
 				Fn: s.redFn, InitFn: s.redIni,
 			})
+		case "tumbling":
+			wop := NewTumblingWindowOp(s.name, store, partition,
+				s.winSize, g.AllowedLateness, g.Extractor)
+			wop.LateFn = g.LateFn
+			ops = append(ops, wop)
+		case "sliding":
+			wop := NewSlidingWindowOp(s.name, store, partition,
+				s.winSize, s.winSlide, g.AllowedLateness, g.Extractor)
+			wop.LateFn = g.LateFn
+			ops = append(ops, wop)
+		case "session":
+			wop := NewSessionWindowOp(s.name, store, partition,
+				s.winGap, g.AllowedLateness, g.Extractor)
+			wop.LateFn = g.LateFn
+			ops = append(ops, wop)
 		default:
 			return RunStats{}, fmt.Errorf("unknown op kind: %s", s.kind)
 		}
@@ -131,8 +146,12 @@ func runTask(ctx context.Context, g *StreamGraph, bv *BrokerView,
 	}
 
 	// Sink fn: if SinkTopic set, produce back to broker; else print.
+	// Watermark sentinels are never sunk — they are control records.
 	var outCount uint64
 	sinkFn := func(r Record) error {
+		if IsWatermark(r) {
+			return nil
+		}
 		atomic.AddUint64(&outCount, 1)
 		if g.SinkTopic == "" {
 			// No sink — for demos that inspect in-memory state.
@@ -145,6 +164,31 @@ func runTask(ctx context.Context, g *StreamGraph, bv *BrokerView,
 	taskStats := RunStats{OperatorCounts: map[string]uint64{}}
 	var inCount uint64
 	var idleSince time.Time
+
+	// M4: source-side watermark generator. We use BoundedOutOfOrderness:
+	// watermark = max_event_time_seen - MaxOutOfOrderness. Emitted into the
+	// op chain every WatermarkInterval and on idle.
+	var wmGen *BoundedOutOfOrdernessGenerator
+	if g.Extractor != nil {
+		wmGen = NewBoundedOutOfOrdernessGenerator(g.MaxOutOfOrderness)
+	}
+	var lastWMEmit time.Time
+	wmInterval := g.WatermarkInterval
+	if wmInterval == 0 {
+		wmInterval = 200 * time.Millisecond
+	}
+	emitWatermark := func() error {
+		if wmGen == nil || len(ops) == 0 {
+			return nil
+		}
+		cur := wmGen.Current()
+		if cur.Equal(MinTime) {
+			return nil
+		}
+		wmRec := NewWatermark(cur)
+		em := &chainEmitter{ops: ops, idx: 0, sinkFn: sinkFn, counts: counts}
+		return ops[0].Process(ctx, wmRec, em)
+	}
 
 	for {
 		select {
@@ -174,6 +218,13 @@ func runTask(ctx context.Context, g *StreamGraph, bv *BrokerView,
 			if time.Since(idleSince) > idleTimeout {
 				break
 			}
+			// On idle, still pulse a watermark so windows can fire.
+			if wmGen != nil && time.Since(lastWMEmit) >= wmInterval {
+				if err := emitWatermark(); err != nil {
+					return taskStats, err
+				}
+				lastWMEmit = time.Now()
+			}
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
@@ -181,6 +232,11 @@ func runTask(ctx context.Context, g *StreamGraph, bv *BrokerView,
 
 		for _, rec := range recs {
 			inCount++
+			// Observe event-time for watermark generation (before Process so
+			// the generator has seen this record when it computes Current()).
+			if wmGen != nil {
+				wmGen.Observe(g.Extractor(rec))
+			}
 			if len(ops) == 0 {
 				if err := sinkFn(rec); err != nil {
 					taskStats.RecordsIn = inCount
@@ -204,6 +260,14 @@ func runTask(ctx context.Context, g *StreamGraph, bv *BrokerView,
 			}
 		}
 		store.CommitOffset(g.SourceTopic, partition, g.SourceGroup, next)
+
+		// Periodic watermark after every batch.
+		if wmGen != nil && time.Since(lastWMEmit) >= wmInterval {
+			if err := emitWatermark(); err != nil {
+				return taskStats, err
+			}
+			lastWMEmit = time.Now()
+		}
 	}
 
 	// Flush operator buffers (no-op for M3 operators; wired up for future windowing).

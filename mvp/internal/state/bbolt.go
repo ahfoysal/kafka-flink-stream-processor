@@ -128,6 +128,17 @@ func (s *Store) Put(op string, partition int, key, val []byte) error {
 	})
 }
 
+// Delete removes a key from (op, partition). No-op if missing.
+func (s *Store) Delete(op string, partition int, key []byte) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketFor(op, partition))
+		if b == nil {
+			return nil
+		}
+		return b.Delete(key)
+	})
+}
+
 // GetUint64 / PutUint64 are a typed convenience used by Count.
 func (s *Store) GetUint64(op string, partition int, key []byte) (uint64, bool, error) {
 	v, ok, err := s.Get(op, partition, key)

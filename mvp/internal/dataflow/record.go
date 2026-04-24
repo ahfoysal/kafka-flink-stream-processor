@@ -24,6 +24,11 @@ type Record struct {
 	Topic     string
 	Partition int
 	Offset    uint64
+
+	// WatermarkNanos, when non-zero, marks this record as a watermark
+	// sentinel rather than a data record. See timestamps.go / IsWatermark.
+	// Window operators use these to decide when to close+emit windows.
+	WatermarkNanos int64
 }
 
 // Copy returns a deep copy — operators mutate Record in place for throughput
